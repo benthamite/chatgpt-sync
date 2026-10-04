@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "ChatGPT Sync",
+  "version": "0.4.0",
+  "description": "Keeps a local, git-versioned copy of your ChatGPT conversations via the chatgpt-sync listener.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoSU5JMynDj5rSdcQemj/XEa5NLrZ0qpTsE9KgqCI0i8jjV4eZfbOLrejWyuCcKcxkYgurACXnBsOO/2BahycXbtQImZUgRVZaKdooW+GBOvQWE/KlEA2vzT5m15Fs+zQQ7E1KesJOukmnV5YerOQ9W9upg/LedC8BlTMsQIR14XuKM67XWidoTGuSMUGolL3kbPgYknHhM7ttLPJ+yH10mDEQlHKsoSd61uGwGurBpZcalJNsNv0AVt+eglMHaHT/+hflTn5em6ta8ZIcYAHYhcMHRfitAZq4z5SFOUdvnN3w+AMXwWqdt+TMVi1xkUyJrDLiCPnsiw/jmItm8q7SQIDAQAB",
+  "permissions": [
+    "alarms",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "http://127.0.0.1:8765/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "ChatGPT Sync",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

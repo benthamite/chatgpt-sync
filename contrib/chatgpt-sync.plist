@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- macOS LaunchAgent that keeps the chatgpt-sync listener running.
+     Replace /PATH/TO/chatgpt-sync and YOUR_USER, copy to
+     ~/Library/LaunchAgents/, then:
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/chatgpt-sync.plist
+     Create ~/.local/state/chatgpt-sync/ first so launchd can write the logs.
+     PATH must include git, and pandoc if you use the Org format. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>chatgpt-sync</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/PATH/TO/chatgpt-sync/bin/chatgpt-sync</string>
+    <string>serve</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/YOUR_USER/.local/state/chatgpt-sync/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOUR_USER/.local/state/chatgpt-sync/launchd.err.log</string>
+</dict>
+</plist>
