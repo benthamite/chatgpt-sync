@@ -52,7 +52,8 @@ chats are included. Chats you delete in ChatGPT are kept locally.
 3. **Load the extension:** open `chrome://extensions`, turn on Developer mode,
    click *Load unpacked*, and choose the `extension/` folder. Use the Chrome
    profile in which you are logged in to ChatGPT.
-4. **Sync:** open chatgpt.com or click the extension's toolbar icon. The first
+4. **Sync:** open chatgpt.com, or click the extension's toolbar icon and
+   then *Sync now*. The first
    run downloads every conversation; ChatGPT rate-limits this to roughly one
    per minute, so a large history takes a while. Progress continues across
    runs.
@@ -101,13 +102,14 @@ file to resume.
   with what the listener already has, and fetches changed ones via
   `/backend-api/conversation/<id>`. It runs every 30 minutes while Chrome is
   open, when you load chatgpt.com (at most every 10 minutes), and when you
-  click its icon. No ChatGPT tab needs to stay open. It waits out rate limits.
+  click *Sync now* in its popup. No ChatGPT tab needs to stay open. It waits out rate limits.
 - **Listener** (`bin/chatgpt-sync`): a dependency-free Python script bound to
   `127.0.0.1`. It only accepts writes from the extension's fixed origin
   (`chrome-extension://peikpbjilajgjpmkipcbgkfamfpihhno`, pinned by the `key`
   in the manifest), writes `raw/` and `index.json`, commits them, and renders.
 
-**Errors** show as a red `!` badge on the toolbar icon; hover for the message.
+**Errors** show as a red `!` badge on the toolbar icon. Click the icon for the
+message; if ChatGPT logged you out, the popup links to the login page.
 The listener records each completed sync in
 `~/.local/state/chatgpt-sync/last-sync.json`, which you can monitor.
 

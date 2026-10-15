@@ -44,7 +44,7 @@ async function setBadge(error) {
   const last = await get('lastSuccess');
   const when = last ? new Date(last).toLocaleString() : 'never';
   await chrome.action.setTitle({
-    title: `ChatGPT Sync\nLast success: ${when}` + (error ? `\nError: ${error}` : ''),
+    title: `ChatGPT Sync\nLast success: ${when}` + (error ? `\nError: ${error}\nClick for details.` : ''),
   });
 }
 
@@ -113,6 +113,7 @@ async function runSync() {
   const errors = [];
   const summary = {listed: 0, fetched: 0};
   let error = null;
+  let errorKind = null;
   try {
     // Ask the listener first, so a stopped or paused listener ends the run
     // before anything is requested from ChatGPT.
@@ -121,7 +122,10 @@ async function runSync() {
     await stage('session');
     const r = await fetch(CHATGPT + '/api/auth/session', {signal: AbortSignal.timeout(30000)});
     const session = await r.json().catch(() => ({}));
-    if (!session.accessToken) throw new Error(`no ChatGPT session (HTTP ${r.status}); log in at chatgpt.com`);
+    if (!session.accessToken) {
+      throw Object.assign(
+        new Error(`no ChatGPT session (HTTP ${r.status}); log in at chatgpt.com`), {kind: 'login'});
+    }
     const token = session.accessToken;
     await stage('listing');
     const listing = await listConversations(token);
@@ -150,8 +154,10 @@ async function runSync() {
     await set({lastSuccess: Date.now()});
   } catch (e) {
     error = String(e && e.message || e);
+    errorKind = e && e.kind || null;
   }
-  await set({lastFinished: Date.now(), lastSummary: summary, lastError: error, run: null});
+  await set({lastFinished: Date.now(), lastSummary: summary, lastError: error,
+             lastErrorKind: errorKind, run: null});
   await setBadge(error);
 }
 
@@ -164,7 +170,7 @@ async function maybeSync(minIntervalMs) {
   if (run) {
     // The worker was stopped mid-run without reaching the end of runSync.
     const error = `previous run died at stage: ${run.stage}`;
-    await set({lastError: error, run: null});
+    await set({lastError: error, lastErrorKind: null, run: null});
     await setBadge(error);
   }
   const lastFinished = (await get('lastFinished')) || 0;
@@ -177,8 +183,8 @@ chrome.alarms.onAlarm.addListener((a) => {
   if (a.name === 'tick') maybeSync(ALARM_INTERVAL_MS);
 });
 
+// The toolbar icon opens popup.html, whose "Sync now" button sends sync-now.
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === 'page-loaded') maybeSync(PAGE_LOAD_INTERVAL_MS);
+  if (msg.type === 'sync-now') maybeSync(0);
 });
-
-chrome.action.onClicked.addListener(() => maybeSync(0));
