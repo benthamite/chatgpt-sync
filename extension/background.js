@@ -16,12 +16,6 @@ const get = async (k) => (await chrome.storage.local.get(k))[k];
 const set = (obj) => chrome.storage.local.set(obj);
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 const FETCH_GAP_MS = 2000;  // pace conversation fetches to stay under rate limits
-// The listing's update_time can lag a conversation's own update_time and stay
-// behind while new messages arrive (seen on a voice conversation: the listing
-// stayed 9 minutes behind for over 15 minutes). So the listing alone misses
-// late messages. Conversations whose stored copy changed within this window
-// are refetched on every sync; the listener writes only if they changed.
-const RECHECK_WINDOW_S = 24 * 60 * 60;
 
 function ensureAlarm() {
   chrome.alarms.create('tick', {periodInMinutes: 15});
@@ -137,11 +131,7 @@ async function runSync() {
     const listing = await listConversations(token);
     summary.listed = listing.length;
     await stage(`listed ${listing.length}`);
-    const now = Date.now() / 1000;
-    const todo = listing.filter((m) => {
-      const stored = ids[m.id] || 0;
-      return Date.parse(m.update_time) / 1000 > stored + 0.001 || now - stored < RECHECK_WINDOW_S;
-    });
+    const todo = listing.filter((m) => Date.parse(m.update_time) / 1000 > (ids[m.id] || 0) + 0.001);
     let batch = [];
     for (const [i, meta] of todo.entries()) {
       await stage(`fetching ${i + 1}/${todo.length}`);
