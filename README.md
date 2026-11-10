@@ -103,6 +103,13 @@ file to resume.
   `/backend-api/conversation/<id>`. It runs every 30 minutes while Chrome is
   open, when you load chatgpt.com (at most every 10 minutes), and when you
   click *Sync now* in its popup. No ChatGPT tab needs to stay open. It waits out rate limits.
+  The listed `update_time` can trail a chat's newest messages for many
+  minutes, so *Sync now* also refetches the chat open in the current tab.
+- **Self-reload**: on each sync the extension sends the listener a hash of
+  the code it has loaded; the listener compares it with the files in
+  `extension/` and logs a mismatch. The extension then reloads itself, so
+  edits to its code take effect without clicking reload on the Extensions
+  page (once it runs a version with this feature).
 - **Listener** (`bin/chatgpt-sync`): a dependency-free Python script bound to
   `127.0.0.1`. It only accepts writes from the extension's fixed origin
   (`chrome-extension://peikpbjilajgjpmkipcbgkfamfpihhno`, pinned by the `key`

@@ -195,6 +195,22 @@ class ListenerTests(unittest.TestCase):
         with open(self.cs.LAST_SYNC) as f:
             self.assertEqual(json.load(f)["summary"], {"fetched": 1})
 
+    def test_state_reports_extension_code_hash(self):
+        status, state = self.request("GET", "/state?v=1.0&code=stale")
+        self.assertEqual(status, 200)
+        self.assertEqual(state["extension_code"], self.cs.extension_code_hash())
+        self.assertRegex(state["extension_code"], r"^[0-9a-f]{64}$")
+
+    def test_extension_code_files_match_extension(self):
+        # Both sides must hash the same files, or the extension would reload
+        # itself in a loop.
+        ext = os.path.join(os.path.dirname(SCRIPT), "..", "extension")
+        on_disk = sorted(n for n in os.listdir(ext) if os.path.isfile(os.path.join(ext, n)))
+        self.assertEqual(sorted(self.cs.EXTENSION_CODE_FILES), on_disk)
+        with open(os.path.join(ext, "background.js")) as f:
+            js = f.read()
+        self.assertIn("const CODE_FILES = " + json.dumps(self.cs.EXTENSION_CODE_FILES) + ";", js)
+
     def test_pause_file_refuses_requests(self):
         open(self.cs.PAUSED, "w").close()
         self.assertEqual(self.request("GET", "/state")[0], 503)

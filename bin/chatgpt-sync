@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import glob
+import hashlib
 import json
 import os
 import re
@@ -36,6 +37,7 @@ import unicodedata
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 # ----------------------------------------------------------------- config
 
@@ -74,6 +76,25 @@ PORT = 8765
 EXTENSION_ORIGIN = "chrome-extension://peikpbjilajgjpmkipcbgkfamfpihhno"
 
 LOCK = threading.Lock()
+
+# The extension's code files, hashed the same way by codeHash() in
+# extension/background.js. The extension reports the hash of the code it has
+# loaded; comparing it with the files on disk shows a stale extension, which
+# then reloads itself. Keep this list identical to CODE_FILES there.
+EXTENSION_DIR = os.path.join(REPO, "extension")
+EXTENSION_CODE_FILES = ["manifest.json", "background.js", "content.js", "popup.html", "popup.js"]
+
+
+def extension_code_hash() -> str | None:
+    """Hash of the extension code on disk, or None outside a repo checkout."""
+    lines = []
+    for name in EXTENSION_CODE_FILES:
+        path = os.path.join(EXTENSION_DIR, name)
+        if not os.path.exists(path):
+            return None
+        with open(path, "rb") as f:
+            lines.append(f"{name}\n{hashlib.sha256(f.read()).hexdigest()}\n")
+    return hashlib.sha256("".join(lines).encode()).hexdigest()
 
 
 # ---------------------------------------------------------------- helpers
@@ -522,10 +543,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._reply(200, {"ok": True})
         if not self._authorized():
             return
-        if self.path == "/state":
+        url = urlsplit(self.path)
+        if url.path == "/state":
+            query = parse_qs(url.query)
+            loaded = (query.get("code") or [None])[0]
+            disk = extension_code_hash()
+            if loaded and disk and loaded != disk:
+                self.log_message("extension %s runs stale code (loaded %s, disk %s)",
+                                 (query.get("v") or ["?"])[0], loaded[:12], disk[:12])
             with LOCK:
                 index = load_index()
-            return self._reply(200, {"ids": {k: v["update_time"] for k, v in index.items()}})
+            return self._reply(200, {"ids": {k: v["update_time"] for k, v in index.items()},
+                                     "extension_code": disk})
         self._reply(404, {"error": "not found"})
 
     def do_POST(self):
@@ -551,7 +580,8 @@ class Handler(BaseHTTPRequestHandler):
                         f"sync: {s.get('fetched', 0)} fetched, {len(flagged)} flag changes")
                 record = {"at": dt.datetime.now().isoformat(timespec="seconds"),
                           "summary": s, "flag_changes": len(flagged),
-                          "commit": commit, "errors": payload.get("errors") or []}
+                          "commit": commit, "errors": payload.get("errors") or [],
+                          "extension": payload.get("extension")}
                 write_atomic(LAST_SYNC, json.dumps(record, indent=1) + "\n")
                 return self._reply(200, {"commit": commit})
         except Exception as e:  # report to the extension, which shows a badge

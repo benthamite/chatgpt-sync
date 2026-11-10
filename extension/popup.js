@@ -25,8 +25,12 @@ async function render() {
   $('sync').disabled = Boolean(run);
 }
 
-$('sync').addEventListener('click', () => {
-  chrome.runtime.sendMessage({type: 'sync-now'});
+// Also refetch the chat open in the current tab, whose listed update_time
+// may not yet show its latest messages.
+$('sync').addEventListener('click', async () => {
+  const [tab] = await chrome.tabs.query({active: true, currentWindow: true});
+  const m = tab && tab.url && tab.url.match(/^https:\/\/chatgpt\.com\/(?:g\/[^/]+\/)?c\/([0-9a-f-]{36})/);
+  chrome.runtime.sendMessage({type: 'sync-now', force: m ? [m[1]] : []});
 });
 chrome.storage.onChanged.addListener(render);
 render();

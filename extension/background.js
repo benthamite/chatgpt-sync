@@ -17,11 +17,44 @@ const set = (obj) => chrome.storage.local.set(obj);
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 const FETCH_GAP_MS = 2000;  // pace conversation fetches to stay under rate limits
 
+const VERSION = chrome.runtime.getManifest().version;
+
+// Hashed the same way by extension_code_hash() in bin/chatgpt-sync, which
+// reports the hash of these files on disk. Keep the two lists identical.
+const CODE_FILES = ["manifest.json", "background.js", "content.js", "popup.html", "popup.js"];
+
+async function sha256hex(data) {
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function codeHash() {
+  let lines = '';
+  for (const name of CODE_FILES) {
+    const r = await fetch(chrome.runtime.getURL(name));
+    lines += `${name}\n${await sha256hex(await r.arrayBuffer())}\n`;
+  }
+  return sha256hex(new TextEncoder().encode(lines));
+}
+
 function ensureAlarm() {
   chrome.alarms.create('tick', {periodInMinutes: 15});
 }
-chrome.runtime.onInstalled.addListener(ensureAlarm);
 chrome.runtime.onStartup.addListener(ensureAlarm);
+
+// Fires on install and on every reload, including the self-reload below.
+chrome.runtime.onInstalled.addListener(async () => {
+  ensureAlarm();
+  // A reload kills any run in progress; drop its state so it doesn't block
+  // syncs (and the popup's button) until its heartbeat goes stale.
+  // The files read now are the code that was just loaded.
+  await set({run: null, loadedCode: await codeHash()});
+  const pending = await get('pendingSync');
+  if (pending) {
+    await set({pendingSync: null});
+    maybeSync(0, pending.force || []);
+  }
+});
 
 // Each stage write also refreshes the run's heartbeat and, being an extension
 // API call, keeps the service worker alive during long runs.
@@ -109,7 +142,7 @@ async function listConversations(token) {
   return [...byId.values()];
 }
 
-async function runSync() {
+async function runSync(force = []) {
   const errors = [];
   const summary = {listed: 0, fetched: 0};
   let error = null;
@@ -118,7 +151,23 @@ async function runSync() {
     // Ask the listener first, so a stopped or paused listener ends the run
     // before anything is requested from ChatGPT.
     await stage('checking listener');
-    const {ids} = await server('GET', '/state');
+    const loadedCode = await get('loadedCode');
+    const state = await server('GET', `/state?v=${VERSION}&code=${loadedCode || ''}`);
+    const ids = state.ids;
+    // The listener reports the hash of the extension code on disk. If it
+    // differs from the loaded code, reload to pick it up, then rerun this sync.
+    // Reload at most once per disk version, so a mismatch that a reload can't
+    // fix (e.g. the extension loaded from another folder) fails loudly
+    // instead of looping.
+    if (state.extension_code && loadedCode && state.extension_code !== loadedCode) {
+      if ((await get('reloadedFor')) === state.extension_code) {
+        throw new Error('extension code on disk differs from the loaded code even after a ' +
+                        'reload; is the extension loaded from this repository?');
+      }
+      await set({reloadedFor: state.extension_code, pendingSync: {force}, run: null});
+      chrome.runtime.reload();
+      await new Promise(() => {});  // the reload ends this worker
+    }
     await stage('session');
     const r = await fetch(CHATGPT + '/api/auth/session', {signal: AbortSignal.timeout(30000)});
     const session = await r.json().catch(() => ({}));
@@ -131,7 +180,13 @@ async function runSync() {
     const listing = await listConversations(token);
     summary.listed = listing.length;
     await stage(`listed ${listing.length}`);
-    const todo = listing.filter((m) => Date.parse(m.update_time) / 1000 > (ids[m.id] || 0) + 0.001);
+    // The listing's update_time can trail new messages for many minutes (seen
+    // on a voice chat), so "Sync now" also refetches the chat open in the
+    // current tab; the listener writes it only if it changed.
+    const forced = new Set(force);
+    const todo = listing.filter((m) =>
+      forced.has(m.id) || Date.parse(m.update_time) / 1000 > (ids[m.id] || 0) + 0.001);
+    for (const id of forced) if (!listing.some((m) => m.id === id)) todo.push({id});
     let batch = [];
     for (const [i, meta] of todo.entries()) {
       await stage(`fetching ${i + 1}/${todo.length}`);
@@ -149,7 +204,8 @@ async function runSync() {
     }
     await stage('finishing');
     const slim = listing.map(({id, is_archived, is_starred}) => ({id, is_archived, is_starred}));
-    await server('POST', '/sync-done', {listing: slim, summary, errors});
+    await server('POST', '/sync-done', {listing: slim, summary, errors,
+                                        extension: {version: VERSION, code: loadedCode}});
     if (errors.length) error = `${errors.length} conversation(s) failed; first: ${errors[0]}`;
     await set({lastSuccess: Date.now()});
   } catch (e) {
@@ -163,7 +219,7 @@ async function runSync() {
 
 let running = null;
 
-async function maybeSync(minIntervalMs) {
+async function maybeSync(minIntervalMs, force = []) {
   if (running) return running;
   const run = await get('run');
   if (run && Date.now() - run.heartbeat < HEARTBEAT_STALE_MS) return;  // another worker instance
@@ -175,7 +231,7 @@ async function maybeSync(minIntervalMs) {
   }
   const lastFinished = (await get('lastFinished')) || 0;
   if (Date.now() - lastFinished < minIntervalMs) return;
-  running = runSync().finally(() => { running = null; });
+  running = runSync(force).finally(() => { running = null; });
   return running;
 }
 
@@ -186,5 +242,5 @@ chrome.alarms.onAlarm.addListener((a) => {
 // The toolbar icon opens popup.html, whose "Sync now" button sends sync-now.
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === 'page-loaded') maybeSync(PAGE_LOAD_INTERVAL_MS);
-  if (msg.type === 'sync-now') maybeSync(0);
+  if (msg.type === 'sync-now') maybeSync(0, msg.force || []);
 });
