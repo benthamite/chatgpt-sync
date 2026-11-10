@@ -218,9 +218,15 @@ async function runSync(force = []) {
 }
 
 let running = null;
+// Chats a "Sync now" asked for while a run was already going; a follow-up run
+// fetches them so the click isn't lost.
+let queuedForce = null;
 
 async function maybeSync(minIntervalMs, force = []) {
-  if (running) return running;
+  if (running) {
+    if (force.length) queuedForce = [...(queuedForce || []), ...force];
+    return running;
+  }
   const run = await get('run');
   if (run && Date.now() - run.heartbeat < HEARTBEAT_STALE_MS) return;  // another worker instance
   if (run) {
@@ -231,7 +237,14 @@ async function maybeSync(minIntervalMs, force = []) {
   }
   const lastFinished = (await get('lastFinished')) || 0;
   if (Date.now() - lastFinished < minIntervalMs) return;
-  running = runSync(force).finally(() => { running = null; });
+  running = runSync(force).finally(() => {
+    running = null;
+    if (queuedForce) {
+      const next = queuedForce;
+      queuedForce = null;
+      maybeSync(0, next);
+    }
+  });
   return running;
 }
 

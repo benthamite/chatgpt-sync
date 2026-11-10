@@ -22,7 +22,8 @@ async function render() {
   $('error').textContent = lastError || '';
   $('login').hidden = !lastError || lastErrorKind !== 'login';
   $('last').textContent = `Last success: ${fmt(lastSuccess)}`;
-  $('sync').disabled = Boolean(run);
+  // Stays enabled during a run: a click then queues the open chat for a
+  // follow-up run.
 }
 
 // Also refetch the chat open in the current tab, whose listed update_time
