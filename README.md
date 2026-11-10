@@ -100,7 +100,9 @@ file to resume.
 - **Extension** (`extension/`): its background service worker lists your
   conversations via `/backend-api/conversations`, compares each `update_time`
   with what the listener already has, and fetches changed ones via
-  `/backend-api/conversation/<id>`. It runs every 30 minutes while Chrome is
+  `/backend-api/conversation/<id>`. Because the listed `update_time` can lag
+  behind new messages, it also refetches every conversation that changed in the
+  last 24 hours; the listener writes only those that actually changed. It runs every 30 minutes while Chrome is
   open, when you load chatgpt.com (at most every 10 minutes), and when you
   click *Sync now* in its popup. No ChatGPT tab needs to stay open. It waits out rate limits.
 - **Listener** (`bin/chatgpt-sync`): a dependency-free Python script bound to
