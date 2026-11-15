@@ -109,7 +109,7 @@ async function api(path, token) {
       await wakefulSleep(wait * 1000, `rate limited; waiting ${wait}s`);
       continue;
     }
-    if (!r.ok) throw new Error(`${path.split('?')[0]}: HTTP ${r.status}`);
+    if (!r.ok) throw Object.assign(new Error(`${path.split('?')[0]}: HTTP ${r.status}`), {status: r.status});
     return r.json();
   }
 }
@@ -144,7 +144,7 @@ async function listConversations(token) {
 
 async function runSync(force = []) {
   const errors = [];
-  const summary = {listed: 0, fetched: 0};
+  const summary = {listed: 0, fetched: 0, documents: 0};
   let error = null;
   let errorKind = null;
   try {
@@ -202,11 +202,12 @@ async function runSync(force = []) {
         batch = [];
       }
     }
+    await syncDocuments(token, summary, errors);
     await stage('finishing');
     const slim = listing.map(({id, is_archived, is_starred}) => ({id, is_archived, is_starred}));
     await server('POST', '/sync-done', {listing: slim, summary, errors,
                                         extension: {version: VERSION, code: loadedCode}});
-    if (errors.length) error = `${errors.length} conversation(s) failed; first: ${errors[0]}`;
+    if (errors.length) error = `${errors.length} conversation(s) or document(s) failed; first: ${errors[0]}`;
     await set({lastSuccess: Date.now()});
   } catch (e) {
     error = String(e && e.message || e);
@@ -215,6 +216,43 @@ async function runSync(force = []) {
   await set({lastFinished: Date.now(), lastSummary: summary, lastError: error,
              lastErrorKind: errorKind, run: null});
   await setBadge(error);
+}
+
+// ChatGPT pages live outside the chats that create or edit them and can
+// change after a chat ends, so every page a stored chat refers to is checked
+// on every run. The listener names the pages (including any that the chats
+// just stored refer to) and the metadata fields that show a change; a page
+// whose fields differ, or that has no stored version, is fetched in full.
+async function syncDocuments(token, summary, errors) {
+  await stage('checking documents');
+  const {documents} = await server('GET', '/documents');
+  const ids = Object.keys(documents);
+  let pages = [];
+  const missing = [];
+  for (const [i, id] of ids.entries()) {
+    await stage(`checking documents ${i + 1}/${ids.length}`);
+    await sleep(FETCH_GAP_MS);
+    try {
+      const known = documents[id].version;
+      if (known) {
+        const {metadata} = await api(`/backend-api/pages/${id}?include_content=false`, token);
+        if (Object.entries(known).every(([k, v]) => metadata[k] === v)) continue;
+        await sleep(FETCH_GAP_MS);
+      }
+      pages.push(await api(`/backend-api/pages/${id}?include_content=true`, token));
+      summary.documents++;
+    } catch (e) {
+      // A deleted page answers 404, also while it is in ChatGPT's trash.
+      // The listener keeps the local copy.
+      if (e.status === 404) missing.push(id);
+      else errors.push(`${id}: ${e.message}`);
+    }
+    if (pages.length >= BATCH) {
+      await server('POST', '/documents', {pages, missing: []});
+      pages = [];
+    }
+  }
+  if (pages.length || missing.length) await server('POST', '/documents', {pages, missing});
 }
 
 let running = null;

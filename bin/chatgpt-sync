@@ -10,6 +10,8 @@ Subcommands:
 Raw conversation JSON in the data directory is the source of truth and is
 committed to a local git repo there after each sync. Markdown (default) or Org
 files are generated from it and can be rebuilt at any time with `render`.
+ChatGPT pages that a conversation creates, edits or reads are stored and
+rendered the same way, and each conversation's file links to them.
 
 Settings come from ~/.config/chatgpt-sync/config.json (or the file named by
 CHATGPT_SYNC_CONFIG). All keys are optional:
@@ -33,6 +35,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unicodedata
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -68,6 +71,8 @@ OUTPUT = os.path.expanduser(CONFIG.get("output_dir") or os.path.join(DATA, FORMA
 STATE_DIR = os.path.expanduser(CONFIG.get("state_dir") or "~/.local/state/chatgpt-sync")
 RAW = os.path.join(DATA, "raw")
 INDEX = os.path.join(DATA, "index.json")
+DOCS_RAW = os.path.join(DATA, "documents")
+DOCS_INDEX = os.path.join(DATA, "documents.json")
 LAST_SYNC = os.path.join(STATE_DIR, "last-sync.json")
 PAUSED = os.path.join(STATE_DIR, "paused")
 
@@ -125,15 +130,31 @@ def write_atomic(path: str, text: str) -> None:
     os.replace(tmp, path)
 
 
-def load_index() -> dict:
-    if os.path.exists(INDEX):
-        with open(INDEX, encoding="utf-8") as f:
+def load_json_map(path: str) -> dict:
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     return {}
 
 
+def write_json(path: str, data: dict) -> None:
+    write_atomic(path, json.dumps(data, indent=1, sort_keys=True, ensure_ascii=False) + "\n")
+
+
+def load_index() -> dict:
+    return load_json_map(INDEX)
+
+
 def save_index(index: dict) -> None:
-    write_atomic(INDEX, json.dumps(index, indent=1, sort_keys=True, ensure_ascii=False) + "\n")
+    write_json(INDEX, index)
+
+
+def load_documents() -> dict:
+    return load_json_map(DOCS_INDEX)
+
+
+def save_documents(docs: dict) -> None:
+    write_json(DOCS_INDEX, docs)
 
 
 def slugify(title: str) -> str:
@@ -304,7 +325,11 @@ def markdown_literal(text: str) -> str:
     return re.sub(r"^(\s{0,3})#", r"\1\\#", text, flags=re.M)
 
 
-def render_markdown(conv: dict, entry: dict) -> str:
+def markdown_link_text(text: str) -> str:
+    return re.sub(r"([][])", r"\\\1", text)
+
+
+def render_markdown(conv: dict, entry: dict, docs: dict) -> str:
     cid = conv_id(conv)
     front = {
         "title": entry["title"],
@@ -327,6 +352,10 @@ def render_markdown(conv: dict, entry: dict) -> str:
             out += [f"## {head}{stamp}", ""]
             prev_key = key
         out += [markdown_literal(md) if key == "user" else shift_headings(md, 2), ""]
+    links = document_links(entry, docs)
+    if links:
+        out += ["## Documents", ""]
+        out += [f"- [{markdown_link_text(label)}]({target})" for target, label in links]
     return "\n".join(out).rstrip("\n") + "\n"
 
 
@@ -336,10 +365,10 @@ PANDOC_FROM = "markdown-smart-auto_identifiers+tex_math_single_backslash"
 SEPARATOR = "CHATGPTSYNCSEPARATOR7F3A"
 
 
-def pandoc(markdown: str) -> str:
+def pandoc(markdown: str, shift: int = 1) -> str:
     out = subprocess.run(
         ["pandoc", "-f", PANDOC_FROM, "-t", "org", "--wrap=preserve",
-         "--shift-heading-level-by=1"],
+         f"--shift-heading-level-by={shift}"],
         input=markdown, capture_output=True, text=True, check=True)
     return out.stdout
 
@@ -366,7 +395,7 @@ def org_literal(text: str) -> str:
     return f"#+begin_example\n{escaped}\n#+end_example"
 
 
-def render_org(conv: dict, entry: dict) -> str:
+def render_org(conv: dict, entry: dict, docs: dict) -> str:
     blocks = visible_blocks(conv)
     converted = iter(md_to_org_many([b[3] for b in blocks if b[0] != "user"]))
     bodies = [org_literal(b[3]) if b[0] == "user" else next(converted) for b in blocks]
@@ -399,14 +428,19 @@ def render_org(conv: dict, entry: dict) -> str:
             out += [f"* {head}{stamp}", ""]
             prev_key = key
         out += [body, ""]
+    links = document_links(entry, docs)
+    if links:
+        out += ["* Documents", ""]
+        out += [f"- [[{target if '://' in target else 'file:' + target}]"
+                f"[{label.replace('[', '(').replace(']', ')')}]]" for target, label in links]
     return "\n".join(out).rstrip("\n") + "\n"
 
 
 RENDERERS = {"markdown": render_markdown, "org": render_org}
 
 
-def render(conv: dict, entry: dict) -> str:
-    return RENDERERS[FORMAT](conv, entry)
+def render(conv: dict, entry: dict, docs: dict) -> str:
+    return RENDERERS[FORMAT](conv, entry, docs)
 
 
 def output_relpath(conv: dict, title: str) -> str:
@@ -417,6 +451,181 @@ def output_relpath(conv: dict, title: str) -> str:
                         # so add its random tail to keep same-second chats apart.
                         f"{created:%Y-%m-%d}--{slugify(title)}--{cid[:8]}{cid[-4:]}"
                         + FORMATS[FORMAT])
+
+
+# -------------------------------------------------------------- documents
+#
+# A ChatGPT page (a "ChatGPT Space" document) lives outside the conversation
+# that creates or edits it: the conversation holds only the tool calls and the
+# page's link, and the page can change after the chat ends. So every page a
+# stored chat refers to is stored on its own (documents/, documents.json),
+# rendered to its own file, linked from the chat's file, and checked for
+# changes on every sync.
+
+PAGE_ID = re.compile(r"\bpage_[0-9a-f]{32}\b")
+# ChatGPT keeps a deleted page in its trash, restorable, for this many days.
+# A page deleted or trashed answers 404 either way, so one that has answered
+# 404 for longer is gone for good and is no longer checked.
+TRASH_DAYS = 30
+
+
+def page_url(pid: str) -> str:
+    return f"https://chatgpt.com/space/{pid}"
+
+
+def document_refs(conv: dict) -> list:
+    """IDs of the ChatGPT pages a conversation refers to, on any branch.
+
+    A page appears as a tool call argument (read_page), in a tool result's
+    resource list (create_page) and as a chatgpt.com/space/<id> link.
+    """
+    return sorted(set(PAGE_ID.findall(json.dumps(conv))))
+
+
+def page_version(page: dict) -> dict:
+    """The page metadata fields that change when the page does.
+
+    The extension compares these with a page's current metadata to decide
+    whether to fetch it. An edit to a page's text or title advances
+    current_sequence but leaves updated_at alone. The sequence recorded is the
+    one the fetched content reflects, so content that trailed the metadata is
+    fetched again on the next sync.
+    """
+    meta = page.get("metadata") or {}
+    content = page.get("content") or {}
+    return {"current_sequence": content.get("through_sequence", meta.get("current_sequence")),
+            "updated_at": meta.get("updated_at"),
+            "deleted_at": meta.get("deleted_at")}
+
+
+def page_updated(page: dict) -> float:
+    """When the page last changed: each block records its own last edit."""
+    blocks = (page.get("content") or {}).get("blocks") or []
+    return max([to_epoch((page.get("metadata") or {}).get("updated_at"))]
+               + [to_epoch((b.get("last_modified") or {}).get("changed_at")) for b in blocks])
+
+
+def page_markdown(page: dict) -> str:
+    md = (page.get("content") or {}).get("markdown")
+    if isinstance(md, str):
+        return md
+    return f"[unrendered page layout: {(page.get('metadata') or {}).get('layout')}]"
+
+
+def document_relpath(pid: str, title: str, created: float) -> str:
+    when = dt.datetime.fromtimestamp(created)
+    return os.path.join("documents", when.strftime("%Y"),
+                        f"{when:%Y-%m-%d}--{slugify(title)}--{pid[-12:]}" + FORMATS[FORMAT])
+
+
+def document_links(entry: dict, docs: dict) -> list:
+    """(target, label) for each page a conversation refers to.
+
+    A stored page is linked by its file's path relative to the conversation's
+    file; one not stored (yet) by its chatgpt.com URL.
+    """
+    links = []
+    for pid in entry.get("documents") or []:
+        doc = docs.get(pid) or {}
+        if doc.get("file"):
+            target = os.path.relpath(doc["file"], os.path.dirname(entry["file"]))
+            links.append((target.replace(os.sep, "/"), doc["title"]))
+        else:
+            links.append((page_url(pid), pid))
+    return links
+
+
+def render_document_markdown(page: dict, entry: dict) -> str:
+    pid = page["metadata"]["page_id"]
+    front = {"title": entry["title"], "chatgpt_page_id": pid, "url": page_url(pid),
+             "created": iso_ts(entry["create_time"]), "updated": iso_ts(entry["update_time"])}
+    out = ["---"]
+    out += [f"{k}: {json.dumps(v, ensure_ascii=False)}" for k, v in front.items()]
+    out += ["---", "", f"# {entry['title']}", "", shift_headings(page_markdown(page), 1)]
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+def render_document_org(page: dict, entry: dict) -> str:
+    pid = page["metadata"]["page_id"]
+    out = [":PROPERTIES:"]
+    if entry.get("org_id"):
+        out.append(f":ID:       {entry['org_id']}")
+    out += [f":CHATGPT_PAGE_ID: {pid}",
+            f":CHATGPT_URL: {page_url(pid)}",
+            f":CREATED: {org_ts(entry['create_time'])}",
+            f":UPDATED: {org_ts(entry['update_time'])}",
+            ":END:", f"#+title: {entry['title']}", "",
+            pandoc(page_markdown(page), shift=0)]
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+DOCUMENT_RENDERERS = {"markdown": render_document_markdown, "org": render_document_org}
+
+
+def rerender_conversations(pid: str, index: dict, docs: dict) -> None:
+    """Rewrite the files of the conversations that link to a page."""
+    for cid, entry in index.items():
+        if pid in (entry.get("documents") or []):
+            with open(os.path.join(RAW, f"{cid}.json"), encoding="utf-8") as f:
+                conv = json.load(f)
+            write_atomic(os.path.join(OUTPUT, entry["file"]), render(conv, entry, docs))
+
+
+def store_document(page: dict, docs: dict, index: dict, force: bool = False) -> bool:
+    """Save one page's raw JSON and rendered file. Return True if written."""
+    meta = page["metadata"]
+    pid = meta["page_id"]
+    if not PAGE_ID.fullmatch(pid):
+        raise ValueError(f"not a page ID: {pid!r}")
+    old = docs.get(pid) or {}
+    version = page_version(page)
+    if old.get("version") == version and not old.get("missing_since") and not force:
+        return False
+    title = meta.get("title") or "Untitled"
+    created = to_epoch(meta.get("created_at"))
+    entry = {"kind": "page", "title": title, "create_time": created,
+             "update_time": page_updated(page), "version": version,
+             "file": document_relpath(pid, title, created)}
+    if old.get("org_id"):
+        entry["org_id"] = old["org_id"]
+    write_json(os.path.join(DOCS_RAW, f"{pid}.json"), page)
+    write_atomic(os.path.join(OUTPUT, entry["file"]), DOCUMENT_RENDERERS[FORMAT](page, entry))
+    if old.get("file") and old["file"] != entry["file"]:
+        stale = os.path.join(OUTPUT, old["file"])
+        if os.path.exists(stale):
+            os.remove(stale)  # renamed page; documents/ history keeps the old version
+    docs[pid] = entry
+    # Links show the page's title and path, so a first fetch or a rename
+    # changes the files of the chats that link to it.
+    if (old.get("file"), old.get("title")) != (entry["file"], entry["title"]):
+        rerender_conversations(pid, index, docs)
+    return True
+
+
+def mark_missing(pid: str, docs: dict, now: float) -> None:
+    """Record that a page answered 404; its local copy is kept."""
+    if not PAGE_ID.fullmatch(pid):
+        raise ValueError(f"not a page ID: {pid!r}")
+    docs.setdefault(pid, {"kind": "page"}).setdefault("missing_since", now)
+
+
+def documents_to_check(index: dict, docs: dict, now: float) -> dict:
+    """The pages the extension should check, with their stored version.
+
+    That is every page a stored chat refers to, except one that has answered
+    404 for longer than ChatGPT keeps deleted pages. A page without a version
+    is fetched in full: one never fetched, or one that answered 404 and may
+    come back from the trash unchanged.
+    """
+    refs = {pid for entry in index.values() for pid in entry.get("documents") or []}
+    out = {}
+    for pid in sorted(refs | set(docs)):
+        doc = docs.get(pid) or {}
+        missing = doc.get("missing_since")
+        if missing and now - missing > TRASH_DAYS * 86400:
+            continue
+        out[pid] = {"kind": "page", "version": None if missing else doc.get("version")}
+    return out
 
 
 # ------------------------------------------------------------------ store
@@ -433,8 +642,12 @@ def ensure_data_repo() -> None:
         write_atomic(ignore, "".join(f"/{f}\n" for f in FORMATS))
 
 
-def store(conv: dict, meta: dict | None, index: dict, force: bool = False) -> bool:
-    """Save one conversation's raw JSON and rendered file. Return True if written."""
+def store(conv: dict, meta: dict | None, index: dict, docs: dict, force: bool = False) -> bool:
+    """Save one conversation's raw JSON and rendered file. Return True if written.
+
+    docs (the documents index) is only read, to link the pages the chat
+    refers to.
+    """
     cid = conv_id(conv)
     meta = meta or {}
     update = max(to_epoch(conv.get("update_time")), to_epoch(meta.get("update_time")))
@@ -461,12 +674,12 @@ def store(conv: dict, meta: dict | None, index: dict, force: bool = False) -> bo
         "is_starred": flag("is_starred"),
         "gizmo_id": conv.get("gizmo_id"),
         "file": output_relpath(conv, title),
+        "documents": document_refs(conv),
     }
     if old and old.get("org_id"):
         entry["org_id"] = old["org_id"]
-    write_atomic(os.path.join(RAW, f"{cid}.json"),
-                 json.dumps(conv, indent=1, sort_keys=True, ensure_ascii=False) + "\n")
-    write_atomic(os.path.join(OUTPUT, entry["file"]), render(conv, entry))
+    write_json(os.path.join(RAW, f"{cid}.json"), conv)
+    write_atomic(os.path.join(OUTPUT, entry["file"]), render(conv, entry, docs))
     if old and old.get("file") and old["file"] != entry["file"]:
         stale = os.path.join(OUTPUT, old["file"])
         if os.path.exists(stale):
@@ -475,7 +688,7 @@ def store(conv: dict, meta: dict | None, index: dict, force: bool = False) -> bo
     return True
 
 
-def update_flags(listing: list, index: dict) -> list:
+def update_flags(listing: list, index: dict, docs: dict) -> list:
     """Apply archived/starred changes that don't bump update_time."""
     changed = []
     for item in listing:
@@ -490,12 +703,15 @@ def update_flags(listing: list, index: dict) -> list:
     for cid in changed:
         with open(os.path.join(RAW, f"{cid}.json"), encoding="utf-8") as f:
             conv = json.load(f)
-        write_atomic(os.path.join(OUTPUT, index[cid]["file"]), render(conv, index[cid]))
+        write_atomic(os.path.join(OUTPUT, index[cid]["file"]), render(conv, index[cid], docs))
     return changed
 
 
 def git_commit(message: str) -> str | None:
-    paths = ["raw", "index.json"]
+    # git refuses a pathspec that matches nothing, as documents/ does until
+    # the first page is stored.
+    paths = [p for p in ("raw", "index.json", "documents", "documents.json")
+             if os.path.exists(os.path.join(DATA, p))]
     subprocess.run(["git", "-C", DATA, "add", "-A", *paths], check=True)
     staged = subprocess.run(["git", "-C", DATA, "diff", "--cached", "--quiet"])
     if staged.returncode == 0:
@@ -555,6 +771,10 @@ class Handler(BaseHTTPRequestHandler):
                 index = load_index()
             return self._reply(200, {"ids": {k: v["update_time"] for k, v in index.items()},
                                      "extension_code": disk})
+        if url.path == "/documents":
+            with LOCK:
+                checks = documents_to_check(load_index(), load_documents(), time.time())
+            return self._reply(200, {"documents": checks})
         self._reply(404, {"error": "not found"})
 
     def do_POST(self):
@@ -566,18 +786,30 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/conversations":
                 with LOCK:
                     index = load_index()
+                    docs = load_documents()
                     written = [conv_id(it["conversation"]) for it in payload["items"]
-                               if store(it["conversation"], it.get("meta"), index)]
+                               if store(it["conversation"], it.get("meta"), index, docs)]
                     save_index(index)
+                return self._reply(200, {"written": len(written)})
+            if self.path == "/documents":
+                with LOCK:
+                    index = load_index()
+                    docs = load_documents()
+                    written = [p for p in payload.get("pages") or []
+                               if store_document(p, docs, index)]
+                    for pid in payload.get("missing") or []:
+                        mark_missing(pid, docs, time.time())
+                    save_documents(docs)
                 return self._reply(200, {"written": len(written)})
             if self.path == "/sync-done":
                 with LOCK:
                     index = load_index()
-                    flagged = update_flags(payload.get("listing") or [], index)
+                    flagged = update_flags(payload.get("listing") or [], index, load_documents())
                     save_index(index)
                     s = payload.get("summary") or {}
                     commit = git_commit(
-                        f"sync: {s.get('fetched', 0)} fetched, {len(flagged)} flag changes")
+                        f"sync: {s.get('fetched', 0)} fetched, {len(flagged)} flag changes, "
+                        f"{s.get('documents', 0)} documents")
                 record = {"at": dt.datetime.now().isoformat(timespec="seconds"),
                           "summary": s, "flag_changes": len(flagged),
                           "commit": commit, "errors": payload.get("errors") or [],
@@ -622,11 +854,11 @@ def read_export(path: str) -> list:
     return convs
 
 
-def parallel_store(convs: list, index: dict, force: bool) -> int:
+def parallel_store(convs: list, index: dict, docs: dict, force: bool) -> int:
     # Rendering dominates; index updates happen on the main thread afterwards.
     def work(conv):
         local = {conv_id(conv): index[conv_id(conv)]} if conv_id(conv) in index else {}
-        return local if store(conv, None, local, force) else None
+        return local if store(conv, None, local, docs, force) else None
     n = 0
     with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
         for result in pool.map(work, convs):
@@ -642,7 +874,7 @@ def cmd_import(args) -> None:
     convs = read_export(args.path)
     with LOCK:
         index = load_index()
-        n = parallel_store(convs, index, force=False)
+        n = parallel_store(convs, index, load_documents(), force=False)
         save_index(index)
         commit = git_commit(f"import: {n} of {len(convs)} conversations from official export")
     print(f"{len(convs)} in export, {n} new or newer, commit {commit}")
@@ -652,18 +884,27 @@ def cmd_render(args) -> None:
     require_pandoc()
     with LOCK:
         index = load_index()
+        docs = load_documents()
+        pages = 0
+        for pid in docs:
+            path = os.path.join(DOCS_RAW, f"{pid}.json")
+            if os.path.exists(path):  # not so for a page that was never fetched
+                with open(path, encoding="utf-8") as f:
+                    pages += store_document(json.load(f), docs, index, force=True)
+        save_documents(docs)
         convs = []
         for cid in index:
             with open(os.path.join(RAW, f"{cid}.json"), encoding="utf-8") as f:
                 convs.append(json.load(f))
-        n = parallel_store(convs, index, force=True)
+        n = parallel_store(convs, index, docs, force=True)
         save_index(index)
-    print(f"re-rendered {n} conversations as {FORMAT} in {OUTPUT}")
+    print(f"re-rendered {n} conversations and {pages} documents as {FORMAT} in {OUTPUT}")
 
 
 def cmd_status(args) -> None:
     index = load_index()
-    print(f"{len(index)} conversations ({sum(e['is_archived'] for e in index.values())} archived)")
+    print(f"{len(index)} conversations ({sum(e['is_archived'] for e in index.values())} archived), "
+          f"{len(load_documents())} documents")
     print(f"format {FORMAT}, data {DATA}, output {OUTPUT}")
     if os.path.exists(LAST_SYNC):
         with open(LAST_SYNC) as f:
