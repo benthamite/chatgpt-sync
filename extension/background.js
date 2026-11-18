@@ -118,6 +118,7 @@ async function listConversations(token) {
   const byId = new Map();
   for (const archived of [false, true]) {
     for (let off = 0; ; off += PAGE) {
+      await stage(`listing ${archived ? 'archived' : 'active'} chats (${off} checked)`);
       const j = await api(`/backend-api/conversations?offset=${off}&limit=${PAGE}` +
         `&order=updated&is_archived=${archived}&hide_snorlax=false`, token);
       for (const it of j.items || []) byId.set(it.id, it);
@@ -126,12 +127,14 @@ async function listConversations(token) {
   }
   // Project ("snorlax") chats, in case the main list leaves them out.
   for (let cursor = null, first = true; first || cursor; first = false) {
+    await stage(`listing projects (${byId.size} chats found)`);
     const sb = await api('/backend-api/gizmos/snorlax/sidebar?conversations_per_gizmo=0' +
       (cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''), token);
     for (const item of sb.items || []) {
       const gid = item.gizmo && item.gizmo.gizmo && item.gizmo.gizmo.id;
       if (!gid) continue;
       for (let c = '0'; c != null; ) {
+        await stage(`listing project chats (${byId.size} chats found)`);
         const j = await api(`/backend-api/gizmos/${gid}/conversations?cursor=${encodeURIComponent(c)}`, token);
         for (const it of j.items || []) if (!byId.has(it.id)) byId.set(it.id, it);
         c = j.cursor != null && (j.items || []).length ? j.cursor : null;

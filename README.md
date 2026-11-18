@@ -116,6 +116,8 @@ file to resume.
   `/backend-api/conversation/<id>`. It runs every 30 minutes while Chrome is
   open, when you load chatgpt.com (at most every 10 minutes), and when you
   click *Sync now* in its popup. No ChatGPT tab needs to stay open. It waits out rate limits.
+  Discovery refreshes the worker heartbeat before each chat or project page,
+  so long listings keep the worker alive and show progress in the popup.
   The listed `update_time` can trail a chat's newest messages for many
   minutes, so *Sync now* also refetches the chat open in the current tab.
 - **Pages**: after the chats, the extension asks the listener which pages
